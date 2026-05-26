@@ -1,0 +1,25 @@
+# Egress IP blacklist example.
+# Copy this file or pass it directly with:
+# --egress-blacklist .\blacklist.example.txt
+#
+# Empty lines are ignored.
+# Lines beginning with # are ignored.
+# Invalid active rules will fail startup.
+#
+# Supported rule types:
+#
+# Exact IPv4:
+# 139.144.196.179
+#
+# Exact IPv6:
+# 2606:4700:4700::1111
+#
+# CIDR:
+# 185.0.0.0/8
+# 2606:4700::/32
+#
+# Simple prefix rule:
+# 139.139.*
+#
+# Add active rules below by removing the leading #.
+

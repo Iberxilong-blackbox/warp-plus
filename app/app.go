@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"path"
+	"time"
 
+	"github.com/bepass-org/warp-plus/egresscheck"
 	"github.com/bepass-org/warp-plus/iputils"
 	"github.com/bepass-org/warp-plus/psiphon"
 	"github.com/bepass-org/warp-plus/warp"
@@ -33,6 +36,7 @@ type WarpOptions struct {
 	WireguardConfig string
 	Reserved        string
 	TestURL         string
+	EgressCheck     *egresscheck.Config
 }
 
 type PsiphonOptions struct {
@@ -422,6 +426,10 @@ func runWarpWithPsiphon(ctx context.Context, l *slog.Logger, opts WarpOptions, e
 		return err
 	}
 
+	if opts.EgressCheck != nil {
+		return runWarpWithCheckedPsiphon(ctx, l, opts, warpBind)
+	}
+
 	// run psiphon
 	err = psiphon.RunPsiphon(ctx, l.With("subsystem", "psiphon"), warpBind, opts.CacheDir, opts.Bind, opts.Psiphon.Country)
 	if err != nil {
@@ -430,6 +438,158 @@ func runWarpWithPsiphon(ctx context.Context, l *slog.Logger, opts WarpOptions, e
 
 	l.Info("serving proxy", "address", opts.Bind)
 	return nil
+}
+
+type checkedPsiphon struct {
+	logger   *slog.Logger
+	warpBind netip.AddrPort
+	opts     WarpOptions
+	checker  *egresscheck.Checker
+}
+
+type checkedTunnel struct {
+	tunnel *psiphon.Tunnel
+	addr   netip.AddrPort
+	result egresscheck.Result
+}
+
+func runWarpWithCheckedPsiphon(ctx context.Context, l *slog.Logger, opts WarpOptions, warpBind netip.AddrPort) error {
+	checker, err := egresscheck.New(*opts.EgressCheck)
+	if err != nil {
+		return err
+	}
+
+	manager := checkedPsiphon{
+		logger:   l,
+		warpBind: warpBind,
+		opts:     opts,
+		checker:  checker,
+	}
+
+	current, err := manager.startAccepted(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		current.tunnel.Close()
+	}()
+
+	relay, relayAddr, err := startTCPRelay(ctx, l, opts.Bind, current.addr)
+	if err != nil {
+		return err
+	}
+
+	l.Info("serving proxy", "address", relayAddr)
+
+	interval := opts.EgressCheck.CheckInterval
+	if interval <= 0 {
+		<-ctx.Done()
+		return nil
+	}
+
+	acceptedIP := current.result.IP
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			result, err := checker.Check(ctx, current.addr)
+			if err != nil {
+				l.Warn("egress check failed", "reason", result.Reason, "error", err)
+				result.Pass = false
+			}
+			if result.IP.IsValid() && result.IP != acceptedIP {
+				l.Info("egress ip changed", "old", acceptedIP, "new", result.IP)
+			}
+			if result.Pass {
+				acceptedIP = result.IP
+				logEgressAccepted(l, result)
+				continue
+			}
+
+			logEgressRejected(l, result, 0)
+			current.tunnel.Close()
+			next, err := manager.startAccepted(ctx)
+			if err != nil {
+				return err
+			}
+			current = next
+			acceptedIP = next.result.IP
+			relay.setUpstream(next.addr)
+		}
+	}
+}
+
+func (m checkedPsiphon) startAccepted(ctx context.Context) (checkedTunnel, error) {
+	maxRetry := m.opts.EgressCheck.MaxRetry
+	if maxRetry <= 0 {
+		maxRetry = 3
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetry; attempt++ {
+		addr, err := freeLocalAddr()
+		if err != nil {
+			return checkedTunnel{}, err
+		}
+
+		tunnel, err := psiphon.StartPsiphon(ctx, m.logger.With("subsystem", "psiphon"), m.warpBind, m.opts.CacheDir, addr, m.opts.Psiphon.Country)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		result, err := m.checker.Check(ctx, addr)
+		if err != nil {
+			lastErr = err
+			m.logger.Warn("egress check failed", "reason", result.Reason, "retry", attempt, "error", err)
+			tunnel.Close()
+			continue
+		}
+		if result.Pass {
+			logEgressAccepted(m.logger, result)
+			return checkedTunnel{tunnel: tunnel, addr: addr, result: result}, nil
+		}
+
+		logEgressRejected(m.logger, result, attempt)
+		tunnel.Close()
+	}
+
+	if lastErr != nil {
+		return checkedTunnel{}, fmt.Errorf("unable to find acceptable egress after %d attempts: %w", maxRetry, lastErr)
+	}
+	return checkedTunnel{}, fmt.Errorf("unable to find acceptable egress after %d attempts", maxRetry)
+}
+
+func freeLocalAddr() (netip.AddrPort, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).AddrPort(), nil
+}
+
+func logEgressAccepted(l *slog.Logger, result egresscheck.Result) {
+	args := []any{"ip", result.IP}
+	if result.Score != nil {
+		args = append(args, "score", *result.Score)
+	}
+	l.Info("egress accepted", args...)
+}
+
+func logEgressRejected(l *slog.Logger, result egresscheck.Result, retry int) {
+	args := []any{"ip", result.IP, "reason", result.Reason, "retry", retry}
+	if result.Rule != "" {
+		args = append(args, "rule", result.Rule)
+	}
+	if result.Score != nil {
+		args = append(args, "score", *result.Score)
+	}
+	l.Info("egress rejected", args...)
 }
 
 func generateWireguardConfig(i *warp.Identity) wiresocks.Configuration {

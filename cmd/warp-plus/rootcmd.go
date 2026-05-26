@@ -12,12 +12,15 @@ import (
 
 	"github.com/adrg/xdg"
 	"github.com/bepass-org/warp-plus/app"
+	"github.com/bepass-org/warp-plus/egresscheck"
 	p "github.com/bepass-org/warp-plus/psiphon"
 	"github.com/bepass-org/warp-plus/warp"
 	"github.com/bepass-org/warp-plus/wiresocks"
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffval"
 )
+
+const defaultEgressBlacklistPath = "blacklist.example.txt"
 
 type rootConfig struct {
 	flags   *ff.FlagSet
@@ -41,6 +44,14 @@ type rootConfig struct {
 	wgConf   string
 	testUrl  string
 	config   string
+
+	egressCheck         bool
+	egressIPURL         string
+	egressBlacklistPath string
+	egressScoreAPI      string
+	egressScoreMax      int
+	egressMaxRetry      int
+	egressCheckInterval time.Duration
 }
 
 func newRootCmd() *rootConfig {
@@ -135,6 +146,42 @@ func newRootCmd() *rootConfig {
 		LongName:  "config",
 		Value:     ffval.NewValueDefault(&cfg.config, ""),
 	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName:  "egress-check",
+		Value:     ffval.NewValueDefault(&cfg.egressCheck, false),
+		Usage:     "enable final egress IP checking for cfon mode",
+		NoDefault: true,
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "egress-ip-url",
+		Value:    ffval.NewValueDefault(&cfg.egressIPURL, egresscheck.DefaultIPURL),
+		Usage:    "URL that returns the current egress IP",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "egress-blacklist",
+		Value:    ffval.NewValueDefault(&cfg.egressBlacklistPath, defaultEgressBlacklistPath),
+		Usage:    "egress blacklist file path",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "egress-score-api",
+		Value:    ffval.NewValueDefault(&cfg.egressScoreAPI, ""),
+		Usage:    "egress score API URL; {ip} is replaced with the detected IP",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "egress-score-max",
+		Value:    ffval.NewValueDefault(&cfg.egressScoreMax, -1),
+		Usage:    "maximum allowed egress score",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "egress-max-retry",
+		Value:    ffval.NewValueDefault(&cfg.egressMaxRetry, 3),
+		Usage:    "maximum egress rebuild attempts during selection",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "egress-check-interval",
+		Value:    ffval.NewValueDefault(&cfg.egressCheckInterval, 5*time.Minute),
+		Usage:    "egress check interval while running; set 0 to disable monitoring",
+	})
 	cfg.command = &ff.Command{
 		Name:  appName,
 		Flags: cfg.flags,
@@ -152,6 +199,10 @@ func (c *rootConfig) exec(ctx context.Context, args []string) error {
 
 	if c.psiphon && c.gool {
 		fatal(l, errors.New("can't use cfon and gool at the same time"))
+	}
+
+	if c.egressCheck && !c.psiphon {
+		fatal(l, errors.New("egress-check is currently supported only with cfon mode"))
 	}
 
 	if c.v4 && c.v6 {
@@ -198,6 +249,21 @@ func (c *rootConfig) exec(ctx context.Context, args []string) error {
 	if c.psiphon {
 		l.Info("psiphon mode enabled", "country", c.country)
 		opts.Psiphon = &app.PsiphonOptions{Country: c.country}
+	}
+
+	if c.egressCheck {
+		blacklist, err := egresscheck.LoadBlacklist(c.egressBlacklistPath)
+		if err != nil {
+			fatal(l, fmt.Errorf("invalid egress blacklist: %w", err))
+		}
+		opts.EgressCheck = &egresscheck.Config{
+			IPURL:         c.egressIPURL,
+			Blacklist:     blacklist,
+			ScoreAPI:      c.egressScoreAPI,
+			ScoreMax:      c.egressScoreMax,
+			MaxRetry:      c.egressMaxRetry,
+			CheckInterval: c.egressCheckInterval,
+		}
 	}
 
 	if c.scan {

@@ -5,3 +5,6 @@
 .idea
 stuff/
 .DS_Store
+
+.gocache/
+.gomodcache/

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"path/filepath"
+	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon"
 )
@@ -56,12 +57,28 @@ type NoticeEvent struct {
 	Timestamp string                 `json:"timestamp"`
 }
 
-func StartTunnel(ctx context.Context, l *slog.Logger, config *psiphon.Config) error {
+type Tunnel struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (t *Tunnel) Close() {
+	t.cancel()
+	select {
+	case <-t.done:
+	case <-time.After(5 * time.Second):
+	}
+	psiphon.CloseDataStore()
+	psiphon.SetNoticeWriter(io.Discard)
+}
+
+func StartTunnel(ctx context.Context, l *slog.Logger, config *psiphon.Config) (*Tunnel, error) {
 	controllerCtx, cancel := context.WithCancel(ctx)
 	// config.Commit must be called before calling config.SetParameters
 	// or attempting to connect.
 	if err := config.Commit(true); err != nil {
-		return errors.New("config.Commit failed")
+		cancel()
+		return nil, errors.New("config.Commit failed")
 	}
 
 	// Will receive a value when the tunnel has successfully connected.
@@ -97,21 +114,30 @@ func StartTunnel(ctx context.Context, l *slog.Logger, config *psiphon.Config) er
 		}))
 
 	if err := psiphon.OpenDataStore(config); err != nil {
-		return errors.New("failed to open data store")
+		cancel()
+		return nil, errors.New("failed to open data store")
 	}
 
 	if err := psiphon.ImportEmbeddedServerEntries(controllerCtx, config, "", ""); err != nil {
-		return err
+		cancel()
+		psiphon.CloseDataStore()
+		psiphon.SetNoticeWriter(io.Discard)
+		return nil, err
 	}
 
 	// Create the Psiphon controller
 	controller, err := psiphon.NewController(config)
 	if err != nil {
-		return errors.New("psiphon.NewController failed")
+		cancel()
+		psiphon.CloseDataStore()
+		psiphon.SetNoticeWriter(io.Discard)
+		return nil, errors.New("psiphon.NewController failed")
 	}
 
+	done := make(chan struct{})
 	// Begin tunnel connection
 	go func() {
+		defer close(done)
 		// Start the tunnel. Only returns on error (or internal timeout).
 		controller.Run(controllerCtx)
 
@@ -124,16 +150,16 @@ func StartTunnel(ctx context.Context, l *slog.Logger, config *psiphon.Config) er
 	// Wait for an active tunnel or error
 	select {
 	case <-connected:
-		return nil
+		return &Tunnel{cancel: cancel, done: done}, nil
 	case err := <-errored:
 		cancel()
 		psiphon.CloseDataStore()
 		psiphon.SetNoticeWriter(io.Discard)
-		return err
+		return nil, err
 	}
 }
 
-func RunPsiphon(ctx context.Context, l *slog.Logger, wgBind netip.AddrPort, dir string, localSocksAddr netip.AddrPort, country string) error {
+func StartPsiphon(ctx context.Context, l *slog.Logger, wgBind netip.AddrPort, dir string, localSocksAddr netip.AddrPort, country string) (*Tunnel, error) {
 	host := ""
 	if !netip.MustParsePrefix("127.0.0.0/8").Contains(localSocksAddr.Addr()) {
 		host = "any"
@@ -162,9 +188,22 @@ func RunPsiphon(ctx context.Context, l *slog.Logger, wgBind netip.AddrPort, dir 
 	}
 
 	l.Info("starting handshake")
-	if err := StartTunnel(ctx, l, &config); err != nil {
-		return fmt.Errorf("Unable to start psiphon: %w", err)
+	tunnel, err := StartTunnel(ctx, l, &config)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to start psiphon: %w", err)
 	}
 	l.Info("psiphon started successfully")
+	return tunnel, nil
+}
+
+func RunPsiphon(ctx context.Context, l *slog.Logger, wgBind netip.AddrPort, dir string, localSocksAddr netip.AddrPort, country string) error {
+	tunnel, err := StartPsiphon(ctx, l, wgBind, dir, localSocksAddr, country)
+	if err != nil {
+		return err
+	}
+	go func() {
+		<-ctx.Done()
+		tunnel.Close()
+	}()
 	return nil
 }
