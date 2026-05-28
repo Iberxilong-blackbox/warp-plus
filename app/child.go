@@ -149,7 +149,17 @@ func RunChild(ctx context.Context, l *slog.Logger, opts WarpOptions, cfg ChildCo
 		}
 
 		psiphonAddr = addr
-		l.Info("child egress accepted", "attempt", attempt, "ip", checkResult.IP, "port", addr.Port())
+		l.Info(
+			"child egress accepted",
+			"attempt", attempt,
+			"egress_ip", checkResult.IP,
+			"server_entry_ip", tunnel.Server.IP,
+			"server_entry_region", tunnel.Server.Region,
+			"server_entry_provider_id", tunnel.Server.ProviderID,
+			"server_entry_diagnostic_id", tunnel.Server.DiagnosticID,
+			"protocol", tunnel.Server.Protocol,
+			"port", addr.Port(),
+		)
 		break
 	}
 

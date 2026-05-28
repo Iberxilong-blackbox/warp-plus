@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon"
@@ -57,9 +58,18 @@ type NoticeEvent struct {
 	Timestamp string                 `json:"timestamp"`
 }
 
+type ServerInfo struct {
+	IP           string
+	Region       string
+	ProviderID   string
+	DiagnosticID string
+	Protocol     string
+}
+
 type Tunnel struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+	Server ServerInfo
 }
 
 func (t *Tunnel) Close() {
@@ -70,6 +80,89 @@ func (t *Tunnel) Close() {
 	}
 	psiphon.CloseDataStore()
 	psiphon.SetNoticeWriter(io.Discard)
+}
+
+type observedServerInfo struct {
+	mu   sync.Mutex
+	info ServerInfo
+}
+
+func (o *observedServerInfo) updateFromNotice(event NoticeEvent) {
+	if event.Type != "ConnectedServer" && event.Type != "ActiveTunnel" {
+		return
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if v := noticeString(event.Data, "diagnosticID"); v != "" {
+		o.info.DiagnosticID = v
+	}
+	if v := noticeString(event.Data, "region"); v != "" {
+		o.info.Region = v
+	}
+	if v := noticeString(event.Data, "serverRegion"); v != "" {
+		o.info.Region = v
+	}
+	if v := noticeString(event.Data, "providerID"); v != "" {
+		o.info.ProviderID = v
+	}
+	if v := noticeString(event.Data, "protocol"); v != "" {
+		o.info.Protocol = v
+	}
+}
+
+func (o *observedServerInfo) snapshot() ServerInfo {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.info
+}
+
+func noticeString(data map[string]interface{}, key string) string {
+	value, ok := data[key]
+	if !ok || value == nil {
+		return ""
+	}
+	s, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return s
+}
+
+func lookupConnectedServerInfo(config *psiphon.Config, observed ServerInfo) (ServerInfo, error) {
+	if observed.DiagnosticID == "" {
+		return observed, nil
+	}
+
+	_, iterator, err := psiphon.NewServerEntryIterator(config)
+	if err != nil {
+		return observed, err
+	}
+	defer iterator.Close()
+
+	for {
+		serverEntry, err := iterator.Next()
+		if err != nil {
+			return observed, err
+		}
+		if serverEntry == nil {
+			return observed, nil
+		}
+		if serverEntry.GetDiagnosticID() != observed.DiagnosticID {
+			continue
+		}
+
+		info := observed
+		info.IP = serverEntry.IpAddress
+		if info.Region == "" {
+			info.Region = serverEntry.Region
+		}
+		if info.ProviderID == "" {
+			info.ProviderID = serverEntry.ProviderID
+		}
+		return info, nil
+	}
 }
 
 func StartTunnel(ctx context.Context, l *slog.Logger, config *psiphon.Config) (*Tunnel, error) {
@@ -85,6 +178,7 @@ func StartTunnel(ctx context.Context, l *slog.Logger, config *psiphon.Config) (*
 	connected := make(chan struct{})
 	// Will receive a value if an error occurs during the connection sequence.
 	errored := make(chan error)
+	observedServer := &observedServerInfo{}
 
 	// Set up notice handling
 	psiphon.SetNoticeWriter(psiphon.NewNoticeReceiver(
@@ -93,6 +187,7 @@ func StartTunnel(ctx context.Context, l *slog.Logger, config *psiphon.Config) (*
 			if err := json.Unmarshal(notice, &event); err != nil {
 				return
 			}
+			observedServer.updateFromNotice(event)
 
 			go func(event NoticeEvent) {
 				l.Debug("psiphon core notice", "type", event.Type, "data", event.Data)
@@ -157,7 +252,24 @@ func StartTunnel(ctx context.Context, l *slog.Logger, config *psiphon.Config) (*
 
 	select {
 	case <-connected:
-		return &Tunnel{cancel: cancel, done: done}, nil
+		serverInfo := observedServer.snapshot()
+		lookedUpServerInfo, err := lookupConnectedServerInfo(config, serverInfo)
+		if err != nil {
+			l.Warn("unable to resolve psiphon connected server entry", "diagnostic_id", serverInfo.DiagnosticID, "error", err)
+		} else {
+			serverInfo = lookedUpServerInfo
+		}
+		if serverInfo.DiagnosticID != "" || serverInfo.IP != "" {
+			l.Info(
+				"psiphon selected server",
+				"server_entry_ip", serverInfo.IP,
+				"server_entry_region", serverInfo.Region,
+				"server_entry_provider_id", serverInfo.ProviderID,
+				"server_entry_diagnostic_id", serverInfo.DiagnosticID,
+				"protocol", serverInfo.Protocol,
+			)
+		}
+		return &Tunnel{cancel: cancel, done: done, Server: serverInfo}, nil
 	case err := <-errored:
 		cancel()
 		psiphon.CloseDataStore()

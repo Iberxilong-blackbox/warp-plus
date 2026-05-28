@@ -2,6 +2,23 @@
 
 本文档记录当前项目在 Windows 本地开发环境中的构建、运行、代理使用方式，以及本次排查中确认的关键问题。
 
+## 0.快速回顾
+
+启动并设置开机自启：
+
+```bash
+systemctl daemon-reload
+systemctl enable --now warp-plus
+systemctl status warp-plus
+```
+
+查看日志：
+
+```bash
+journalctl -u warp-plus -f
+```
+
+
 ## 1. 项目定位
 
 `warp-plus` 是一个 Go 项目。普通模式下，它会建立 Cloudflare WARP 隧道，并在本机启动一个本地代理服务。
