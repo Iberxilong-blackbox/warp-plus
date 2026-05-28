@@ -12,6 +12,7 @@ type Config struct {
 	ScoreMax      int
 	MaxRetry      int
 	CheckInterval time.Duration
+	EventLogPath  string
 }
 
 func (c Config) scoreEnabled() bool {

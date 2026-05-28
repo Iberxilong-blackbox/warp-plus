@@ -33,7 +33,9 @@ cp /var/lib/warp-plus/pool-cache/recent_ips.txt \
    /var/lib/warp-plus/pool-cache/recent_ips.txt.bak.$(date +%Y%m%d-%H%M%S)
 
 : > /var/lib/warp-plus/pool-cache/recent_ips.txt
-
+ 
+systemctl restart warp-plus
+ 
 ```
 
 ## 1. 项目定位
@@ -814,13 +816,22 @@ WARP_BIND
 业务 SOCKS/HTTP 代理监听地址。必须保持 127.0.0.1，不要暴露到公网。
 
 WARP_CONTROL
-control API 监听地址。建议保持 127.0.0.1:9099。
+control API 监听地址。默认建议保持 127.0.0.1:9099。
+如果需要从另一台电脑直接发送 HTTP POST，可以改成 0.0.0.0:9099，但必须配合防火墙白名单。
 
 WARP_TOKEN
 control API Bearer token。不要使用示例值，生产环境必须替换。
+即使已经设置来源 IP 白名单，也建议使用长随机 token。白名单负责限制谁能连到端口，token 负责限制谁能调用接口。
 
 WARP_COUNTRY
 Psiphon 目标出口国家，例如 US、JP、DE。
+```
+
+创建 pool 缓存目录并设置权限：
+
+```bash
+. /etc/default/warp-plus
+install -d -o warp-plus -g warp-plus "$WARP_DATA/pool-cache"
 ```
 
 再创建服务文件：
@@ -842,7 +853,6 @@ User=warp-plus
 Group=warp-plus
 WorkingDirectory=/var/lib/warp-plus
 EnvironmentFile=/etc/default/warp-plus
-ExecStartPre=/usr/bin/install -d -o warp-plus -g warp-plus ${WARP_DATA}/pool-cache
 ExecStart=/usr/local/bin/warp-plus \
   -4 \
   --endpoint ${WARP_ENDPOINT} \
@@ -873,10 +883,139 @@ WantedBy=multi-user.target
 说明：
 
 ```text
+pool-cache 目录由 root 在创建 service 前手动准备。
+service 本身只负责以 warp-plus 用户运行主进程，避免 ExecStartPre 权限差异导致启动失败。
+
 systemd 托管时不需要在 ExecStart 里写 2>&1 | tee。
 stdout/stderr 会进入 journald，用 journalctl -u warp-plus -f 查看。
 
 如果必须额外落文件，优先用 journald 持久化或 logrotate 管理，不建议把 shell 管道作为服务主进程。
+```
+
+#### 12.7.1 允许另一台电脑远程触发 refresh
+
+如果只在服务器本机执行：
+
+```bash
+curl -X POST http://127.0.0.1:9099/connectivity/refresh \
+  -H "Authorization: Bearer $WARP_TOKEN"
+```
+
+保持默认配置即可：
+
+```bash
+WARP_CONTROL=127.0.0.1:9099
+```
+
+如果电脑 A 上有程序需要频繁触发 refresh，优先使用 SSH 隧道，而不是把 `9099` 暴露公网。
+
+思路：
+
+```text
+电脑 A 程序启动前，先建立一条 SSH 本地端口转发。
+电脑 A 本地端口，例如 127.0.0.1:19099，转发到服务器 B 的 127.0.0.1:9099。
+程序运行期间保持 SSH 隧道不关闭。
+程序需要切换出口时，请求 http://127.0.0.1:19099/connectivity/refresh。
+程序结束时关闭 SSH 隧道。
+```
+
+链路：
+
+```text
+电脑 A 程序
+-> 电脑 A 127.0.0.1:19099
+-> SSH 隧道
+-> 服务器 B 127.0.0.1:9099
+-> warp-plus control API
+```
+
+这种方式下服务器仍然保持：
+
+```bash
+WARP_CONTROL=127.0.0.1:9099
+```
+
+优点：
+
+```text
+9099 不暴露公网。
+不需要给 9099 配公网白名单。
+频繁 refresh 只是在已有 SSH 隧道里发送普通 HTTP 请求，不需要每次重新建立 SSH 连接。
+适合由电脑 A 上的程序在运行期间反复触发出口切换。
+```
+
+注意：
+
+```text
+不要每次 refresh 都新建 SSH 隧道。
+应在程序启动时建立一次，程序运行期间复用，程序退出时关闭。
+电脑 A 建议使用 SSH key 登录服务器 B，避免程序卡在密码输入。
+```
+
+如果明确需要从另一台电脑直接发送公网 HTTP POST，让代理服务器切换出口 IP，也可以把 control API 改成公网监听：
+
+```bash
+WARP_CONTROL=0.0.0.0:9099
+```
+
+这种方式必须限制 `9099` 只允许你的控制电脑访问。假设你的控制电脑公网 IP 是：
+
+```text
+203.0.113.10
+```
+
+使用 UFW 白名单：
+
+```bash
+ufw allow from 203.0.113.10 to any port 9099 proto tcp
+ufw deny 9099/tcp
+ufw status numbered
+```
+
+说明：
+
+```text
+UFW 是 Ubuntu 常用防火墙工具。
+如果你的云厂商安全组已经限制了 9099 来源 IP，也可以用安全组实现同样效果。
+最稳妥做法是：云安全组限制一次，服务器 UFW 再限制一次。
+```
+
+修改 `/etc/default/warp-plus` 后重启：
+
+```bash
+systemctl restart warp-plus
+ss -lntp | grep 9099
+```
+
+如果看到：
+
+```text
+0.0.0.0:9099
+```
+
+说明 control API 已监听所有网卡。此时应再确认 UFW 或云安全组已经限制来源 IP。
+
+远程电脑测试：
+
+```bash
+curl http://服务器IP:9099/health
+
+curl -X POST http://服务器IP:9099/connectivity/refresh \
+  -H "Authorization: Bearer 你的WARP_TOKEN"
+```
+
+生成长随机 token：
+
+```bash
+openssl rand -hex 32
+```
+
+不要因为设置了白名单就使用短 token。原因是：
+
+```text
+白名单可能因为公网 IP 变化、NAT、云安全组误配置而失效。
+HTTP 请求中的 token 仍是 control API 的最后一道鉴权。
+长随机 token 的成本很低，但能避免端口误暴露时被直接调用。
 ```
 
 启动并设置开机自启：

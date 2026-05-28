@@ -466,6 +466,7 @@ func runWarpWithPool(ctx context.Context, l *slog.Logger, opts WarpOptions) erro
 	if err != nil {
 		return err
 	}
+	events := egresscheck.NewEventLogger(opts.EgressCheck.EventLogPath)
 
 	// Create relay with a placeholder upstream; the pool sets the real upstream
 	// once the first child registers.
@@ -511,9 +512,20 @@ func runWarpWithPool(ctx context.Context, l *slog.Logger, opts WarpOptions) erro
 			}
 
 			// Re-check current egress through the relay.
+			checkStartedAt := time.Now()
 			checkResult, err := checker.Check(ctx, relayAddr)
 			if err != nil {
 				l.Warn("egress monitor check failed", "error", err)
+				logEvent(l, events, egresscheck.Event{
+					Event:      "egress_monitor_check",
+					Mode:       "pool",
+					ActiveIP:   egresscheck.StringAddr(currentIP),
+					IP:         egresscheck.StringAddr(checkResult.IP),
+					Status:     "rejected",
+					Reason:     checkResult.Reason,
+					DurationMS: time.Since(checkStartedAt).Milliseconds(),
+					Country:    psiphonCountry(opts),
+				})
 				continue
 			}
 			if checkResult.IP.IsValid() && checkResult.IP != currentIP {
@@ -525,6 +537,22 @@ func runWarpWithPool(ctx context.Context, l *slog.Logger, opts WarpOptions) erro
 					checkResult.Reason = "recent_ip_matched"
 				}
 			}
+			monitorStatus := "accepted"
+			if !checkResult.Pass {
+				monitorStatus = "rejected"
+			}
+			logEvent(l, events, egresscheck.Event{
+				Event:      "egress_monitor_check",
+				Mode:       "pool",
+				ActiveIP:   egresscheck.StringAddr(currentIP),
+				IP:         egresscheck.StringAddr(checkResult.IP),
+				Status:     monitorStatus,
+				Reason:     checkResult.Reason,
+				Rule:       checkResult.Rule,
+				Score:      checkResult.Score,
+				DurationMS: time.Since(checkStartedAt).Milliseconds(),
+				Country:    psiphonCountry(opts),
+			})
 			if checkResult.Pass {
 				logEgressAccepted(l, checkResult)
 				continue
@@ -548,7 +576,20 @@ func (p *childPool) rotate(ctx context.Context) rotateStatus {
 
 	p.mu.Lock()
 	readyCount := len(p.readyOrder)
+	warmingCount := p.warmingCountLocked()
+	activeIP := p.currentIPLocked()
 	p.mu.Unlock()
+	p.logEvent(egresscheck.Event{
+		Event:         "rotate_requested",
+		Mode:          "pool",
+		ActiveIP:      egresscheck.StringAddr(activeIP),
+		ReadyCount:    readyCount,
+		WarmingCount:  warmingCount,
+		RequireChange: boolPtr(p.requireChange),
+		RecentIPLimit: p.opts.RotateControl.recentIPLimit(),
+		PoolMinReady:  p.minReady,
+		Country:       p.psiphonCountry(),
+	})
 
 	if readyCount == 0 {
 		// No ready child — trigger pool maintenance to start a new one.
@@ -556,11 +597,37 @@ func (p *childPool) rotate(ctx context.Context) rotateStatus {
 		case p.wakeMaintain <- struct{}{}:
 		default:
 		}
+		p.logEvent(egresscheck.Event{
+			Event:         "rotate_result",
+			Mode:          "pool",
+			Status:        string(rotateStatusBusy),
+			Reason:        "no_ready_child",
+			ActiveIP:      egresscheck.StringAddr(activeIP),
+			ReadyCount:    readyCount,
+			WarmingCount:  warmingCount,
+			RequireChange: boolPtr(p.requireChange),
+			RecentIPLimit: p.opts.RotateControl.recentIPLimit(),
+			PoolMinReady:  p.minReady,
+			Country:       p.psiphonCountry(),
+		})
 		return rotateStatusBusy
 	}
 
 	child, oldIP, status := p.acquireReady()
 	if child == nil {
+		p.logEvent(egresscheck.Event{
+			Event:         "rotate_result",
+			Mode:          "pool",
+			Status:        string(status),
+			OldIP:         egresscheck.StringAddr(oldIP),
+			ActiveIP:      egresscheck.StringAddr(activeIP),
+			ReadyCount:    readyCount,
+			WarmingCount:  warmingCount,
+			RequireChange: boolPtr(p.requireChange),
+			RecentIPLimit: p.opts.RotateControl.recentIPLimit(),
+			PoolMinReady:  p.minReady,
+			Country:       p.psiphonCountry(),
+		})
 		return status
 	}
 
@@ -577,6 +644,20 @@ func (p *childPool) rotate(ctx context.Context) rotateStatus {
 	default:
 	}
 
+	p.logEvent(egresscheck.Event{
+		Event:         "rotate_result",
+		Mode:          "pool",
+		ChildID:       intPtr(child.id),
+		Status:        string(rotateStatusOK),
+		OldIP:         egresscheck.StringAddr(oldIP),
+		NewIP:         egresscheck.StringAddr(child.ip),
+		ReadyCount:    readyCount,
+		WarmingCount:  warmingCount,
+		RequireChange: boolPtr(p.requireChange),
+		RecentIPLimit: p.opts.RotateControl.recentIPLimit(),
+		PoolMinReady:  p.minReady,
+		Country:       p.psiphonCountry(),
+	})
 	return rotateStatusOK
 }
 
@@ -865,6 +946,19 @@ func logEgressRejected(l *slog.Logger, result egresscheck.Result, retry int, dur
 		args = append(args, "duration", duration[0])
 	}
 	l.Info("egress rejected", args...)
+}
+
+func logEvent(l *slog.Logger, events *egresscheck.EventLogger, event egresscheck.Event) {
+	if err := events.Log(event); err != nil {
+		l.Warn("unable to write egress event log", "error", err)
+	}
+}
+
+func psiphonCountry(opts WarpOptions) string {
+	if opts.Psiphon == nil {
+		return ""
+	}
+	return opts.Psiphon.Country
 }
 
 func generateWireguardConfig(i *warp.Identity) wiresocks.Configuration {

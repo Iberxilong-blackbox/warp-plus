@@ -53,6 +53,7 @@ type rootConfig struct {
 	egressScoreMax      int
 	egressMaxRetry      int
 	egressCheckInterval time.Duration
+	egressEventLog      string
 
 	controlBind          string
 	controlToken         string
@@ -195,6 +196,11 @@ func newRootCmd() *rootConfig {
 		LongName: "egress-check-interval",
 		Value:    ffval.NewValueDefault(&cfg.egressCheckInterval, 5*time.Minute),
 		Usage:    "egress check interval while running; set 0 to disable monitoring",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "egress-event-log",
+		Value:    ffval.NewValueDefault(&cfg.egressEventLog, ""),
+		Usage:    "append egress rotation events to this JSONL log file",
 	})
 	cfg.flags.AddFlag(ff.FlagConfig{
 		LongName: "control-bind",
@@ -353,6 +359,10 @@ func (c *rootConfig) buildWarpOptions() app.WarpOptions {
 	}
 
 	if c.egressCheck {
+		eventLogPath := c.egressEventLog
+		if eventLogPath == "" {
+			eventLogPath = path.Join(opts.CacheDir, "egress_events.jsonl")
+		}
 		blacklist, err := egresscheck.LoadBlacklist(c.egressBlacklistPath)
 		if err != nil {
 			fatal(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})), fmt.Errorf("invalid egress blacklist: %w", err))
@@ -365,6 +375,7 @@ func (c *rootConfig) buildWarpOptions() app.WarpOptions {
 			ScoreMax:      c.egressScoreMax,
 			MaxRetry:      c.egressMaxRetry,
 			CheckInterval: c.egressCheckInterval,
+			EventLogPath:  eventLogPath,
 		}
 	}
 

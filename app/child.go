@@ -112,6 +112,12 @@ func RunChild(ctx context.Context, l *slog.Logger, opts WarpOptions, cfg ChildCo
 	if err != nil {
 		return fmt.Errorf("child: create egress checker: %w", err)
 	}
+	events := egresscheck.NewEventLogger(opts.EgressCheck.EventLogPath)
+	logChildEvent := func(event egresscheck.Event) {
+		if err := events.Log(event); err != nil {
+			l.Warn("unable to write egress event log", "error", err)
+		}
+	}
 
 	maxRetry := opts.EgressCheck.MaxRetry
 	if maxRetry <= 0 {
@@ -123,6 +129,7 @@ func RunChild(ctx context.Context, l *slog.Logger, opts WarpOptions, cfg ChildCo
 	var checkResult egresscheck.Result
 
 	for attempt := 1; attempt <= maxRetry; attempt++ {
+		startedAt := time.Now()
 		addr, err := freeLocalAddr()
 		if err != nil {
 			return fmt.Errorf("child: free local addr: %w", err)
@@ -132,23 +139,78 @@ func RunChild(ctx context.Context, l *slog.Logger, opts WarpOptions, cfg ChildCo
 		tunnel, err = psiphon.StartPsiphon(ctx, l, warpBind, cacheDir, addr, opts.Psiphon.Country)
 		if err != nil {
 			l.Warn("child psiphon handshake failed", "attempt", attempt, "error", err)
+			logChildEvent(egresscheck.Event{
+				Event:      "egress_candidate",
+				Mode:       "child",
+				ChildID:    intPtr(cfg.ID),
+				Attempt:    attempt,
+				MaxRetry:   maxRetry,
+				Status:     "rejected",
+				Reason:     "handshake_failed",
+				DurationMS: time.Since(startedAt).Milliseconds(),
+				Country:    opts.Psiphon.Country,
+			})
 			continue
 		}
 
 		checkResult, err = checker.Check(ctx, addr)
 		if err != nil {
 			l.Warn("child egress check failed", "attempt", attempt, "error", err)
+			logChildEvent(egresscheck.Event{
+				Event:      "egress_candidate",
+				Mode:       "child",
+				ChildID:    intPtr(cfg.ID),
+				Attempt:    attempt,
+				MaxRetry:   maxRetry,
+				IP:         egresscheck.StringAddr(checkResult.IP),
+				Status:     "rejected",
+				Reason:     checkResult.Reason,
+				DurationMS: time.Since(startedAt).Milliseconds(),
+				Country:    opts.Psiphon.Country,
+			})
 			tunnel.Close()
 			continue
 		}
 
 		if !checkResult.Pass {
 			l.Info("child egress rejected", "attempt", attempt, "ip", checkResult.IP, "reason", checkResult.Reason)
+			logChildEvent(egresscheck.Event{
+				Event:      "egress_candidate",
+				Mode:       "child",
+				ChildID:    intPtr(cfg.ID),
+				Attempt:    attempt,
+				MaxRetry:   maxRetry,
+				IP:         egresscheck.StringAddr(checkResult.IP),
+				Status:     "rejected",
+				Reason:     checkResult.Reason,
+				Rule:       checkResult.Rule,
+				Score:      checkResult.Score,
+				DurationMS: time.Since(startedAt).Milliseconds(),
+				Country:    opts.Psiphon.Country,
+			})
 			tunnel.Close()
 			continue
 		}
 
 		psiphonAddr = addr
+		logChildEvent(egresscheck.Event{
+			Event:                   "egress_candidate",
+			Mode:                    "child",
+			ChildID:                 intPtr(cfg.ID),
+			Attempt:                 attempt,
+			MaxRetry:                maxRetry,
+			IP:                      egresscheck.StringAddr(checkResult.IP),
+			Status:                  "accepted",
+			Reason:                  checkResult.Reason,
+			Score:                   checkResult.Score,
+			DurationMS:              time.Since(startedAt).Milliseconds(),
+			Country:                 opts.Psiphon.Country,
+			ServerEntryIP:           tunnel.Server.IP,
+			ServerEntryRegion:       tunnel.Server.Region,
+			ServerEntryProviderID:   tunnel.Server.ProviderID,
+			ServerEntryDiagnosticID: tunnel.Server.DiagnosticID,
+			Protocol:                tunnel.Server.Protocol,
+		})
 		l.Info(
 			"child egress accepted",
 			"attempt", attempt,

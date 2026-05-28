@@ -66,6 +66,7 @@ type childPool struct {
 	logger *slog.Logger
 	relay  *tcpRelay
 	recent *egresscheck.RecentIPs
+	events *egresscheck.EventLogger
 
 	registryLn   net.Listener
 	registrySrv  *http.Server
@@ -80,6 +81,10 @@ type childPool struct {
 const minChildStartupTimeout = 120 * time.Second
 
 func newChildPool(l *slog.Logger, opts WarpOptions, relay *tcpRelay, recent *egresscheck.RecentIPs, requireChange bool) *childPool {
+	var events *egresscheck.EventLogger
+	if opts.EgressCheck != nil {
+		events = egresscheck.NewEventLogger(opts.EgressCheck.EventLogPath)
+	}
 	p := &childPool{
 		children:      make(map[int]*poolChild),
 		activeID:      -1,
@@ -88,6 +93,7 @@ func newChildPool(l *slog.Logger, opts WarpOptions, relay *tcpRelay, recent *egr
 		opts:          opts,
 		relay:         relay,
 		recent:        recent,
+		events:        events,
 		requireChange: requireChange,
 		wakeMaintain:  make(chan struct{}, 8),
 	}
@@ -237,6 +243,13 @@ func (p *childPool) startChild(ctx context.Context) (*poolChild, error) {
 	p.mu.Unlock()
 
 	p.logger.Info("started child process", "id", id, "pid", cmd.Process.Pid)
+	p.logEvent(egresscheck.Event{
+		Event:        "child_started",
+		Mode:         "pool",
+		ChildID:      intPtr(id),
+		Country:      p.psiphonCountry(),
+		PoolMinReady: p.minReady,
+	})
 
 	go p.waitChild(child)
 	go p.watchWarmingTimeout(child)
@@ -356,6 +369,9 @@ func (p *childPool) buildChildArgs(id int, token, cacheDir string) []string {
 			args = append(args, fmt.Sprintf("--egress-score-max=%d", o.EgressCheck.ScoreMax))
 		}
 		args = append(args, fmt.Sprintf("--egress-max-retry=%d", o.EgressCheck.MaxRetry))
+		if o.EgressCheck.EventLogPath != "" {
+			args = append(args, fmt.Sprintf("--egress-event-log=%s", o.EgressCheck.EventLogPath))
+		}
 		// Child doesn't need periodic check — set to 0.
 		args = append(args, "--egress-check-interval=0")
 	}
@@ -422,9 +438,25 @@ func (p *childPool) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	child.port = port
 	child.ip = ip
+	activeIP := netip.Addr{}
+	if p.activeID >= 0 && p.children[p.activeID] != nil {
+		activeIP = p.children[p.activeID].ip
+	}
 
 	if accepted, status := p.registrationAllowedLocked(child); !accepted {
 		p.logger.Info("child registration rejected", "id", child.id, "ip", ip, "reason", status)
+		p.logEvent(egresscheck.Event{
+			Event:         "child_registration_rejected",
+			Mode:          "pool",
+			ChildID:       intPtr(child.id),
+			IP:            ip.String(),
+			ActiveIP:      egresscheck.StringAddr(activeIP),
+			Status:        "rejected",
+			Reason:        status,
+			RequireChange: boolPtr(p.requireChange),
+			RecentIPLimit: p.opts.RotateControl.recentIPLimit(),
+			Country:       p.psiphonCountry(),
+		})
 		p.killChildLocked(child.id)
 		p.mu.Unlock()
 		writeControlStatus(w, http.StatusConflict, status)
@@ -442,6 +474,17 @@ func (p *childPool) handleRegister(w http.ResponseWriter, r *http.Request) {
 		p.mu.Unlock()
 
 		p.logger.Info("child activated (first)", "id", child.id, "port", port.Port(), "ip", ip)
+		p.logEvent(egresscheck.Event{
+			Event:         "child_activated_first",
+			Mode:          "pool",
+			ChildID:       intPtr(child.id),
+			IP:            ip.String(),
+			NewIP:         ip.String(),
+			Status:        "ok",
+			RequireChange: boolPtr(p.requireChange),
+			RecentIPLimit: p.opts.RotateControl.recentIPLimit(),
+			Country:       p.psiphonCountry(),
+		})
 		p.relay.setUpstream(port)
 		writeControlStatus(w, http.StatusOK, "ok")
 		select {
@@ -457,6 +500,17 @@ func (p *childPool) handleRegister(w http.ResponseWriter, r *http.Request) {
 	p.mu.Unlock()
 
 	p.logger.Info("child ready", "id", child.id, "port", port.Port(), "ip", ip)
+	p.logEvent(egresscheck.Event{
+		Event:         "child_ready",
+		Mode:          "pool",
+		ChildID:       intPtr(child.id),
+		IP:            ip.String(),
+		ActiveIP:      egresscheck.StringAddr(activeIP),
+		Status:        "ok",
+		RequireChange: boolPtr(p.requireChange),
+		RecentIPLimit: p.opts.RotateControl.recentIPLimit(),
+		Country:       p.psiphonCountry(),
+	})
 	writeControlStatus(w, http.StatusOK, "ok")
 	select {
 	case p.wakeMaintain <- struct{}{}:
@@ -511,6 +565,18 @@ func (p *childPool) acquireReady() (*poolChild, netip.Addr, rotateStatus) {
 
 		if accepted, status := p.registrationAllowedLocked(child); !accepted {
 			p.logger.Info("ready child no longer acceptable, discarding", "id", id, "ip", child.ip, "reason", status)
+			p.logEvent(egresscheck.Event{
+				Event:         "ready_child_rejected",
+				Mode:          "pool",
+				ChildID:       intPtr(id),
+				IP:            egresscheck.StringAddr(child.ip),
+				ActiveIP:      egresscheck.StringAddr(oldIP),
+				Status:        "rejected",
+				Reason:        status,
+				RequireChange: boolPtr(p.requireChange),
+				RecentIPLimit: p.opts.RotateControl.recentIPLimit(),
+				Country:       p.psiphonCountry(),
+			})
 			p.killChildLocked(id)
 			continue
 		}
@@ -521,6 +587,17 @@ func (p *childPool) acquireReady() (*poolChild, netip.Addr, rotateStatus) {
 		p.activeID = id
 
 		p.logger.Info("switched active child", "old_id", oldID, "new_id", id, "old_ip", oldIP, "new_ip", child.ip)
+		p.logEvent(egresscheck.Event{
+			Event:         "active_switched",
+			Mode:          "pool",
+			ChildID:       intPtr(id),
+			OldIP:         egresscheck.StringAddr(oldIP),
+			NewIP:         egresscheck.StringAddr(child.ip),
+			Status:        "ok",
+			RequireChange: boolPtr(p.requireChange),
+			RecentIPLimit: p.opts.RotateControl.recentIPLimit(),
+			Country:       p.psiphonCountry(),
+		})
 		p.killChildLocked(oldID)
 		select {
 		case p.wakeMaintain <- struct{}{}:
@@ -535,6 +612,10 @@ func (p *childPool) acquireReady() (*poolChild, netip.Addr, rotateStatus) {
 func (p *childPool) currentIP() netip.Addr {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.currentIPLocked()
+}
+
+func (p *childPool) currentIPLocked() netip.Addr {
 	if p.activeID < 0 {
 		return netip.Addr{}
 	}
@@ -543,6 +624,37 @@ func (p *childPool) currentIP() netip.Addr {
 		return netip.Addr{}
 	}
 	return active.ip
+}
+
+func (p *childPool) warmingCountLocked() int {
+	count := 0
+	for _, ch := range p.children {
+		if ch.state == childWarming {
+			count++
+		}
+	}
+	return count
+}
+
+func (p *childPool) logEvent(event egresscheck.Event) {
+	if err := p.events.Log(event); err != nil {
+		p.logger.Warn("unable to write egress event log", "error", err)
+	}
+}
+
+func (p *childPool) psiphonCountry() string {
+	if p.opts.Psiphon == nil {
+		return ""
+	}
+	return p.opts.Psiphon.Country
+}
+
+func intPtr(v int) *int {
+	return &v
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }
 
 // killChildLocked kills a child and removes it from tracking. Must hold p.mu.
