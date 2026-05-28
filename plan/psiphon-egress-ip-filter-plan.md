@@ -161,6 +161,81 @@ H3: 二者无稳定关系，只能继续以后置 egresscheck 为准。
 不应把 recent_ips.txt 直接用于 Psiphon 内部候选过滤，只能优化 parent/child 边界。
 ```
 
+## 4.1 Ubuntu 一验采样结论（2026-05-28）
+
+阶段 A 诊断日志已经落地并在 Ubuntu 前台 pool 模式验证：
+
+```text
+psiphon selected server 日志可看到：
+server_entry_ip
+server_entry_region
+server_entry_provider_id
+server_entry_diagnostic_id
+protocol
+
+child egress accepted 日志可同时看到：
+egress_ip
+server_entry_ip
+```
+
+本轮有效样本显示：
+
+```text
+ServerEntry.IpAddress 多数情况下不等于最终 egress IP。
+```
+
+典型映射样本：
+
+```text
+138.68.196.77  -> 107.170.226.114
+74.208.176.91  -> 74.208.212.211
+74.208.16.30   -> 108.175.6.223
+62.151.176.205 -> 74.208.179.218
+74.208.247.74  -> 66.175.234.58
+74.208.179.245 -> 108.175.6.218
+74.208.116.108 -> 74.208.85.204
+```
+
+少数直连或特定路径下也可能相等：
+
+```text
+74.208.116.132 -> 74.208.116.132
+```
+
+同一个 `server_entry_ip` 在本轮样本中多次出现时，观察到较稳定的映射，例如：
+
+```text
+138.68.196.77 -> 107.170.226.114
+74.208.179.245 -> 108.175.6.218
+```
+
+即使 protocol 在 `TLS-OSSH`、`OSSH`、`SSH` 间变化，上述样本中的 egress IP 仍保持一致。
+
+本轮判断：
+
+```text
+H1 基本不成立：不能认为 ServerEntry.IpAddress 等于最终 egress IP。
+H2 有初步证据：server_entry_ip 与 egress_ip 可能存在稳定映射。
+H3 暂不作为主判断：目前未看到完全无关系，但样本仍不足以支撑预筛实现。
+```
+
+直接影响：
+
+```text
+不能把 recent_ips.txt 中的真实出口 IP 直接用于 Psiphon ServerEntry.IpAddress 预过滤。
+否则会漏掉大量重复出口。例如 recent_ips.txt 记录 107.170.226.114，
+但 Psiphon 候选看到的是 138.68.196.77。
+```
+
+当前 refresh 失败原因也进一步明确：
+
+```text
+ready child 已经完成 handshake 和 egresscheck。
+但 parent 只有在 refresh 时才检查 same/recent。
+因此会出现 ready child has same IP as active 或 ready child IP in recent list，
+并导致本次 refresh 返回 no_acceptable_egress。
+```
+
 ## 5. 下一步开发计划
 
 ### 阶段 A：增加诊断日志
@@ -229,6 +304,29 @@ same/recent 拒绝是否可以被 server_entry_ip 提前预测
 ```
 
 ### 阶段 C：根据结果选择实现路线
+
+基于 2026-05-28 Ubuntu 一验样本，本轮选择短期稳妥路线：
+
+```text
+优先实现路线 3：不改 Psiphon 内部，前移 parent 注册校验。
+```
+
+选择理由：
+
+```text
+ServerEntry.IpAddress 与 egress IP 不等价，不能直接用于 recent IP 预筛。
+parent 注册阶段已经拿到真实 egress IP，可以可靠判断 same/recent。
+该方案不 fork Psiphon SDK，改动范围集中在 parent/child 注册边界。
+```
+
+原则对应：
+
+```text
+KISS: 只把已有 refresh 校验提前到注册阶段，不引入映射缓存或 SDK patch。
+YAGNI: 暂不实现 server_entry_ip -> egress_ip 学习表，等更多样本证明收益后再做。
+DRY: 复用现有 same/recent 判断逻辑，避免注册和 refresh 两套规则分叉。
+SRP: child 继续只负责建连和上报真实 egress IP；parent 负责池准入和切换决策。
+```
 
 #### 路线 1：修改 Psiphon `ServerEntryIterator.Next()`
 
@@ -319,20 +417,22 @@ refresh 只从已合格 ready child 中切换。
 
 ## 6. 当前暂不做
 
-在确认 ServerEntry IP 与 egress IP 的关系前，不做：
+基于当前样本，下一阶段仍暂不做：
 
 ```text
 不直接把 recent_ips.txt 塞进 Psiphon 内部过滤。
 不 fork Psiphon SDK。
 不改变 refresh 返回语义。
 不降低 recent-ip-limit 来“制造成功率”。
+不先实现 server_entry_ip -> egress_ip 映射缓存。
 ```
 
 原因：
 
 ```text
 当前要测试实际使用场景。
-如果 ServerEntry.IpAddress 与真实出口 IP 不一致，提前过滤会引入错误行为。
+ServerEntry.IpAddress 已确认经常与真实出口 IP 不一致，提前过滤会引入漏筛或误筛。
+映射缓存虽然可能可行，但需要更多样本和过期策略，不作为短期稳妥路线。
 ```
 
 ## 7. 验收标准

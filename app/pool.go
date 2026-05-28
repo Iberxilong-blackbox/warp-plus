@@ -423,6 +423,18 @@ func (p *childPool) handleRegister(w http.ResponseWriter, r *http.Request) {
 	child.port = port
 	child.ip = ip
 
+	if accepted, status := p.registrationAllowedLocked(child); !accepted {
+		p.logger.Info("child registration rejected", "id", child.id, "ip", ip, "reason", status)
+		p.killChildLocked(child.id)
+		p.mu.Unlock()
+		writeControlStatus(w, http.StatusConflict, status)
+		select {
+		case p.wakeMaintain <- struct{}{}:
+		default:
+		}
+		return
+	}
+
 	if p.activeID < 0 {
 		// No active child yet — make this one active.
 		child.state = childActive
@@ -452,6 +464,24 @@ func (p *childPool) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// registrationAllowedLocked applies pool admission rules to a child that has
+// reported its real egress IP. Must hold p.mu.
+func (p *childPool) registrationAllowedLocked(child *poolChild) (bool, string) {
+	if child == nil {
+		return false, "invalid_child"
+	}
+	if p.activeID >= 0 && p.requireChange && child.ip.IsValid() {
+		active := p.children[p.activeID]
+		if active != nil && active.ip.IsValid() && child.ip == active.ip {
+			return false, "rejected_same_ip"
+		}
+	}
+	if p.recent != nil && p.recent.Contains(child.ip) {
+		return false, "rejected_recent_ip"
+	}
+	return true, "ok"
+}
+
 // acquireReady switches the relay to the next ready child that satisfies IP constraints.
 // Called from rotate(). Returns nil if no acceptable child is available.
 func (p *childPool) acquireReady() (*poolChild, netip.Addr, rotateStatus) {
@@ -478,14 +508,8 @@ func (p *childPool) acquireReady() (*poolChild, netip.Addr, rotateStatus) {
 			continue
 		}
 
-		// Check IP constraints.
-		if p.requireChange && child.ip.IsValid() && child.ip == oldIP {
-			p.logger.Info("ready child has same IP as active, discarding", "id", id, "ip", child.ip)
-			p.killChildLocked(id)
-			continue
-		}
-		if p.recent != nil && p.recent.Contains(child.ip) {
-			p.logger.Info("ready child IP in recent list, discarding", "id", id, "ip", child.ip)
+		if accepted, status := p.registrationAllowedLocked(child); !accepted {
+			p.logger.Info("ready child no longer acceptable, discarding", "id", id, "ip", child.ip, "reason", status)
 			p.killChildLocked(id)
 			continue
 		}
