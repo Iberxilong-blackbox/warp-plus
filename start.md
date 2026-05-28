@@ -18,6 +18,13 @@ systemctl status warp-plus
 journalctl -u warp-plus -f
 ```
 
+手动触发出口刷新：
+
+```bash
+curl -X POST http://127.0.0.1:9099/connectivity/refresh \
+  -H "Authorization: Bearer $WARP_TOKEN"
+```
+
 
 ## 1. 项目定位
 
@@ -430,10 +437,19 @@ warp-plus 只需要监听 127.0.0.1:10086，不需要 root 权限。
 这也符合：
 
 ```text
-KISS：保持单进程、本地端口、systemd 托管。
+KISS：保持本地端口、systemd 托管和清晰的进程边界。
 YAGNI：不额外引入 Docker、supervisor 或复杂脚本。
 SRP：root 只做管理，warp-plus 用户只负责运行服务。
 DRY：s-ui 继续负责用户和路由分流，warp-plus 只负责 WARP 出口。
+```
+
+当前开启 control/pool 后，`warp-plus` 会由主进程管理 child 进程池：
+
+```text
+KISS：仍然只暴露一个本机业务端口 127.0.0.1:10086 和一个本机 control 端口 127.0.0.1:9099。
+YAGNI：不引入额外守护程序，进程池由 warp-plus 自身管理。
+SRP：parent 负责 relay/control/pool，child 负责独立 WARP + Psiphon + egresscheck。
+DRY：出口检查、黑名单、recent IP 规则复用同一套 CLI 配置。
 ```
 
 ### 12.1 确认服务器架构
@@ -571,45 +587,121 @@ warp-plus 用户
 
 ### 12.6 手动测试服务
 
-正式写 systemd 前，先手动跑一次，确认服务器网络可以建立 WARP，并顺便测试指定国家出口用法。
+正式写 systemd 前，先手动跑一次，确认服务器网络可以建立 WARP、Psiphon 指定国家出口、出口 IP 检查、control API 和 pool 子进程都能正常工作。
 
 使用 root 执行：
 
 ```bash
-sudo -u warp-plus /usr/local/bin/warp-plus \
+export WARP_PLUS=/usr/local/bin/warp-plus
+export WARP_DATA=/var/lib/warp-plus
+export WARP_BLACKLIST=/opt/warp-plus/blacklist.example.txt
+export WARP_ENDPOINT=188.114.98.7:3581
+export WARP_BIND=127.0.0.1:10086
+export WARP_CONTROL=127.0.0.1:9099
+export WARP_TOKEN=test-token
+
+install -d -o warp-plus -g warp-plus "$WARP_DATA/pool-cache"
+
+sudo -u warp-plus env \
+  WARP_PLUS="$WARP_PLUS" \
+  WARP_DATA="$WARP_DATA" \
+  WARP_BLACKLIST="$WARP_BLACKLIST" \
+  WARP_ENDPOINT="$WARP_ENDPOINT" \
+  WARP_BIND="$WARP_BIND" \
+  WARP_CONTROL="$WARP_CONTROL" \
+  WARP_TOKEN="$WARP_TOKEN" \
+  bash -lc '
+"$WARP_PLUS" \
   -4 \
-  --scan \
+  --endpoint "$WARP_ENDPOINT" \
   --cfon \
   --country US \
   --test-url http://example.com/ \
-  --bind 127.0.0.1:10086 \
-  --cache-dir /var/lib/warp-plus
+  --bind "$WARP_BIND" \
+  --cache-dir "$WARP_DATA/pool-cache" \
+  --egress-check \
+  --egress-blacklist "$WARP_BLACKLIST" \
+  --egress-max-retry 2 \
+  --egress-check-interval 0 \
+  --control-bind "$WARP_CONTROL" \
+  --control-token "$WARP_TOKEN" \
+  --recent-ip-file "$WARP_DATA/pool-cache/recent_ips.txt" \
+  --recent-ip-limit 50 \
+  --pool-min-ready 1 \
+  --verbose 2>&1 | tee "$WARP_DATA/pool-server-entry.log"
+'
 ```
 
 说明：
 
 ```text
+--endpoint "$WARP_ENDPOINT"
+固定一个已验证可用的 Cloudflare WARP endpoint，避免每次启动都受 scan 波动影响。
+
 --cfon --country US
 表示启用 Psiphon 模式，并尝试使用 US 作为最终出口国家。
 
-如果只想测试普通 WARP 出口，可以去掉 --cfon 和 --country US。
+--cache-dir "$WARP_DATA/pool-cache"
+pool 模式的主缓存目录。子进程会在该目录下创建独立 child_N 数据目录，避免 Psiphon data store 冲突。
+
+--egress-check
+启用最终出口 IP 检查。当前只支持和 --cfon 一起使用。
+
+--egress-blacklist "$WARP_BLACKLIST"
+出口 IP 黑名单文件，支持单 IP、CIDR 和简单前缀规则。
+
+--egress-max-retry 2
+每个 child 选择出口时最多尝试 2 次，避免无限等待不可用 Psiphon 节点。
+
+--egress-check-interval 0
+关闭运行期定时出口检查。当前主要依赖手动 control API 触发刷新。
+
+--control-bind "$WARP_CONTROL"
+启用本机 control API，用于 health 检查和手动刷新出口。
+
+--control-token "$WARP_TOKEN"
+control API 的 Bearer token。即使只监听 127.0.0.1，也建议保留。
+
+--recent-ip-file "$WARP_DATA/pool-cache/recent_ips.txt"
+记录最近使用过的出口 IP，避免 refresh 后马上切回旧出口。
+
+--recent-ip-limit 50
+最多保留 50 个近期出口 IP。
+
+--pool-min-ready 1
+保持至少 1 个 ready child，refresh 时可以直接切换到已预热出口。
 ```
 
 看到以下日志说明服务启动成功：
 
 ```text
 connection test successful
+child registry listening
+child activated (first)
+pool maintenance started
+serving rotate control address=127.0.0.1:9099
 serving proxy address=127.0.0.1:10086
 ```
 
-另开一个 SSH 窗口测试：
+另开一个 SSH 窗口测试。如果新窗口没有上面的环境变量，先补充：
+
+```bash
+export WARP_DATA=/var/lib/warp-plus
+export WARP_TOKEN=test-token
+```
+
+再执行：
 
 ```bash
 curl --socks5-hostname 127.0.0.1:10086 https://api.ipify.org
 curl --socks5-hostname 127.0.0.1:10086 https://ipinfo.io/json
+curl http://127.0.0.1:9099/health
+curl -X POST http://127.0.0.1:9099/connectivity/refresh \
+  -H "Authorization: Bearer $WARP_TOKEN"
+cat "$WARP_DATA/pool-cache/recent_ips.txt"
 ```
 
-如果能正常返回 IP 或 JSON，说明服务器本机已经可以通过 `warp-plus` 走当前代理出口。
+如果能正常返回 IP 或 JSON，且 `/health` 返回 `{"status":"ok"}`，说明服务器本机已经可以通过 `warp-plus` 走当前代理出口，并且 control API 已可用。
 
 注意：
 
@@ -632,6 +724,19 @@ warp=on
 ```
 
 说明服务器本机已经可以通过 `warp-plus` 走 WARP 出口。
+
+`POST /connectivity/refresh` 的常见返回：
+
+```text
+{"status":"ok"}
+刷新成功，新连接会走新出口。
+
+{"status":"busy"}
+当前没有 ready child，旧 active 仍继续服务，稍后再试。
+
+{"status":"no_acceptable_egress"}
+ready child 的出口命中 same/recent/blacklist 等规则，已被丢弃，旧 active 仍继续服务。
+```
 
 如果某个站点返回：
 
@@ -660,46 +765,52 @@ nano /etc/default/warp-plus
 写入：
 
 ```bash
-# warp-plus 启动参数。
+# warp-plus 启动参数和运行路径。
 # 修改本文件后，只需要执行：systemctl restart warp-plus
 # 只有修改 /etc/systemd/system/warp-plus.service 后，才需要执行：systemctl daemon-reload
 
-# -4
-# 只使用 IPv4 连接 Cloudflare WARP endpoint。服务器 IPv6 不稳定时建议保留。
-#
-# --scan
-# 启动时扫描可用的 Cloudflare WARP endpoint，选择质量较好的入口。
-#
-# --test-url http://example.com/
-# 启动前连通性检测地址。该项目要求测试地址对 HEAD 请求返回 HTTP 200。
-#
-# --bind 127.0.0.1:10086
-# 本地 SOCKS/HTTP 代理监听地址。必须只监听 127.0.0.1，不要暴露到公网。
-#
-# --cache-dir /var/lib/warp-plus
-# WARP identity 和运行缓存目录。该目录归 warp-plus 专用用户使用。
-#
-# --cfon
-# 可选。启用 Psiphon 模式。链路变为：s-ui -> warp-plus -> WARP -> Psiphon -> 目标网站。
-#
-    # --country US
-    # 可选。开启cfon参数欧，指定 Psiphon 最终出口国家为 US。只有开启 --cfon 时才有意义。
-#
-# 普通 WARP 模式：
-WARP_PLUS_ARGS="-4 --scan --test-url http://example.com/ --bind 127.0.0.1:10086 --cache-dir /var/lib/warp-plus --cfon --country US"
-
-# 如果要使用 US 国家出口，注释上一行，取消下一行注释：
-# WARP_PLUS_ARGS="-4 --scan --cfon --country US --test-url http://example.com/ --bind 127.0.0.1:10086 --cache-dir /var/lib/warp-plus"
+WARP_ENDPOINT=188.114.98.7:3581
+WARP_DATA=/var/lib/warp-plus
+WARP_BLACKLIST=/opt/warp-plus/blacklist.example.txt
+WARP_BIND=127.0.0.1:10086
+WARP_CONTROL=127.0.0.1:9099
+WARP_TOKEN=replace-with-random-long-token
+WARP_COUNTRY=US
 ```
 
 说明：
 
 ```text
 /etc/default/warp-plus
-只放启动参数，后续改端口、改国家、切换普通模式和 cfon 模式，优先改这个文件。
+只放容易变化的参数。后续改 endpoint、端口、国家、control token、黑名单路径，优先改这个文件。
 
 warp-plus.service
 只负责指定运行用户、工作目录、重启策略和调用程序本体。
+```
+
+参数含义：
+
+```text
+WARP_ENDPOINT
+固定的 Cloudflare WARP endpoint。建议先通过前台普通 WARP 验证后再写入。
+
+WARP_DATA
+服务数据根目录。当前 pool 模式实际使用 $WARP_DATA/pool-cache。
+
+WARP_BLACKLIST
+出口 IP 黑名单文件。启用 --egress-check 时会加载该文件。
+
+WARP_BIND
+业务 SOCKS/HTTP 代理监听地址。必须保持 127.0.0.1，不要暴露到公网。
+
+WARP_CONTROL
+control API 监听地址。建议保持 127.0.0.1:9099。
+
+WARP_TOKEN
+control API Bearer token。不要使用示例值，生产环境必须替换。
+
+WARP_COUNTRY
+Psiphon 目标出口国家，例如 US、JP、DE。
 ```
 
 再创建服务文件：
@@ -712,7 +823,7 @@ nano /etc/systemd/system/warp-plus.service
 
 ```ini
 [Unit]
-Description=warp-plus local WARP outbound proxy
+Description=warp-plus pooled WARP/Psiphon outbound proxy
 After=network-online.target
 Wants=network-online.target
 
@@ -721,7 +832,25 @@ User=warp-plus
 Group=warp-plus
 WorkingDirectory=/var/lib/warp-plus
 EnvironmentFile=/etc/default/warp-plus
-ExecStart=/usr/local/bin/warp-plus $WARP_PLUS_ARGS
+ExecStartPre=/usr/bin/install -d -o warp-plus -g warp-plus ${WARP_DATA}/pool-cache
+ExecStart=/usr/local/bin/warp-plus \
+  -4 \
+  --endpoint ${WARP_ENDPOINT} \
+  --cfon \
+  --country ${WARP_COUNTRY} \
+  --test-url http://example.com/ \
+  --bind ${WARP_BIND} \
+  --cache-dir ${WARP_DATA}/pool-cache \
+  --egress-check \
+  --egress-blacklist ${WARP_BLACKLIST} \
+  --egress-max-retry 2 \
+  --egress-check-interval 0 \
+  --control-bind ${WARP_CONTROL} \
+  --control-token ${WARP_TOKEN} \
+  --recent-ip-file ${WARP_DATA}/pool-cache/recent_ips.txt \
+  --recent-ip-limit 50 \
+  --pool-min-ready 1 \
+  --verbose
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
@@ -729,6 +858,15 @@ PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
+```
+
+说明：
+
+```text
+systemd 托管时不需要在 ExecStart 里写 2>&1 | tee。
+stdout/stderr 会进入 journald，用 journalctl -u warp-plus -f 查看。
+
+如果必须额外落文件，优先用 journald 持久化或 logrotate 管理，不建议把 shell 管道作为服务主进程。
 ```
 
 启动并设置开机自启：
@@ -865,34 +1003,38 @@ auth_user 需要和 sing-box 入站里对应用户的 name / username 匹配。
 1. 先确认 warp-plus 本机代理可用。
 2. 再确认 s-ui / sing-box 配置保存并重启成功。
 3. 用被分流的用户连接代理。
-4. 访问 Cloudflare trace 检查 warp=on。
+4. 访问出口 IP 查询站点，确认被分流用户的出口与服务器直连出口不同。
 ```
 
 服务器本机测试：
 
 ```bash
-curl --socks5 127.0.0.1:10086 https://www.cloudflare.com/cdn-cgi/trace
+curl --socks5-hostname 127.0.0.1:10086 https://api.ipify.org
+curl --socks5-hostname 127.0.0.1:10086 https://ipinfo.io/json
 ```
 
 客户端侧测试：
 
 ```text
+https://api.ipify.org
+https://ipinfo.io/json
+```
+
+如果使用普通 WARP 模式，可以额外访问：
+
+```text
 https://www.cloudflare.com/cdn-cgi/trace
 ```
 
-如果被分流用户看到：
-
-```text
-warp=on
-```
-
-说明链路已经是：
+普通 WARP 模式下看到 `warp=on`，说明链路已经是：
 
 ```text
 用户客户端 -> s-ui / sing-box -> warp-plus -> Cloudflare WARP -> 目标网站
 ```
 
-### 12.11 可选：cfon 模式
+如果使用当前推荐的 `--cfon --country US`，最终出口通常是 Psiphon 节点，`warp=on` 不能作为唯一判断标准。此时优先看 `api.ipify.org` / `ipinfo.io` 返回的出口 IP 和国家信息，并用 control API refresh 前后对比出口是否变化。
+
+### 12.11 可选：切换国家或切回普通 WARP
 
 普通模式：
 
@@ -906,16 +1048,22 @@ s-ui -> warp-plus -> Cloudflare WARP -> 目标网站
 s-ui -> warp-plus -> WARP -> Psiphon -> 指定国家出口 -> 目标网站
 ```
 
-如果确实需要指定 Psiphon 出口国家，优先修改参数文件：
+当前 systemd 示例默认使用 `--cfon --country ${WARP_COUNTRY}`、出口检查、control API 和 pool。要切换国家，只需要修改参数文件：
 
 ```bash
 nano /etc/default/warp-plus
 ```
 
-把 `WARP_PLUS_ARGS` 改成：
+例如把：
 
 ```bash
-WARP_PLUS_ARGS="-4 --scan --cfon --country US --test-url http://example.com/ --bind 127.0.0.1:10086 --cache-dir /var/lib/warp-plus"
+WARP_COUNTRY=US
+```
+
+改成：
+
+```bash
+WARP_COUNTRY=JP
 ```
 
 然后重启：
@@ -925,22 +1073,45 @@ systemctl restart warp-plus
 journalctl -u warp-plus -f
 ```
 
-如果只想切回普通 WARP 模式，就改回：
+如果只想切回普通 WARP 模式，需要修改 `/etc/systemd/system/warp-plus.service`，移除这些只适用于 cfon/pool 的参数：
 
-```bash
-WARP_PLUS_ARGS="-4 --scan --test-url http://example.com/ --bind 127.0.0.1:10086 --cache-dir /var/lib/warp-plus"
+```text
+--cfon
+--country ${WARP_COUNTRY}
+--egress-check
+--egress-blacklist ${WARP_BLACKLIST}
+--egress-max-retry 2
+--egress-check-interval 0
+--control-bind ${WARP_CONTROL}
+--control-token ${WARP_TOKEN}
+--recent-ip-file ${WARP_DATA}/pool-cache/recent_ips.txt
+--recent-ip-limit 50
+--pool-min-ready 1
+--verbose
 ```
 
-再执行：
+保留最小普通 WARP 参数：
+
+```ini
+ExecStart=/usr/local/bin/warp-plus \
+  -4 \
+  --endpoint ${WARP_ENDPOINT} \
+  --test-url http://example.com/ \
+  --bind ${WARP_BIND} \
+  --cache-dir ${WARP_DATA}/normal-warp-cache
+```
+
+修改 service 文件后执行：
 
 ```bash
+systemctl daemon-reload
 systemctl restart warp-plus
 ```
 
 建议：
 
 ```text
-第一阶段优先使用普通 WARP 模式。
-只有明确需要指定国家出口时，再开启 --cfon。
---cfon 会引入 Psiphon 网络，信任边界和故障点都会增加。
+如果目标是固定国家出口和手动刷新 IP，继续使用当前 cfon + egress-check + control/pool 配置。
+如果目标只是让一部分流量套 WARP，不需要指定国家出口，可以切回普通 WARP 模式。
+--cfon 会引入 Psiphon 网络，信任边界和故障点都比普通 WARP 更多。
 ```
