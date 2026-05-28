@@ -470,13 +470,14 @@ func (p *childPool) registrationAllowedLocked(child *poolChild) (bool, string) {
 	if child == nil {
 		return false, "invalid_child"
 	}
-	if p.activeID >= 0 && p.requireChange && child.ip.IsValid() {
+	hasActive := p.activeID >= 0
+	if hasActive && p.requireChange && child.ip.IsValid() {
 		active := p.children[p.activeID]
 		if active != nil && active.ip.IsValid() && child.ip == active.ip {
 			return false, "rejected_same_ip"
 		}
 	}
-	if p.recent != nil && p.recent.Contains(child.ip) {
+	if hasActive && p.recent != nil && p.recent.Contains(child.ip) {
 		return false, "rejected_recent_ip"
 	}
 	return true, "ok"

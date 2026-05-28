@@ -26,12 +26,30 @@ func TestRegistrationAllowedRejectsSameActiveIP(t *testing.T) {
 	}
 }
 
-func TestRegistrationAllowedRejectsRecentIPBeforeFirstActive(t *testing.T) {
+func TestRegistrationAllowedAllowsRecentIPBeforeFirstActive(t *testing.T) {
 	ip := netip.MustParseAddr("203.0.113.20")
 	recent := testRecentIPs(t, ip)
 	pool := testChildPool(t, recent, true)
 
 	child := &poolChild{id: 1, state: childWarming, ip: ip}
+	accepted, status := pool.registrationAllowedLocked(child)
+	if !accepted {
+		t.Fatalf("expected first active registration to be allowed, got status %s", status)
+	}
+	if status != "ok" {
+		t.Fatalf("unexpected status: %s", status)
+	}
+}
+
+func TestRegistrationAllowedRejectsRecentIPAfterActive(t *testing.T) {
+	activeIP := netip.MustParseAddr("203.0.113.21")
+	readyIP := netip.MustParseAddr("203.0.113.22")
+	recent := testRecentIPs(t, readyIP)
+	pool := testChildPool(t, recent, true)
+	pool.activeID = 1
+	pool.children[1] = &poolChild{id: 1, state: childActive, ip: activeIP}
+
+	child := &poolChild{id: 2, state: childWarming, ip: readyIP}
 	accepted, status := pool.registrationAllowedLocked(child)
 	if accepted {
 		t.Fatal("expected registration to be rejected")
