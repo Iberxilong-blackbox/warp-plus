@@ -118,6 +118,29 @@ func (o *observedServerInfo) snapshot() ServerInfo {
 	return o.info
 }
 
+func (o *observedServerInfo) waitForDiagnosticID(ctx context.Context, timeout time.Duration) ServerInfo {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		info := o.snapshot()
+		if info.DiagnosticID != "" {
+			return info
+		}
+
+		select {
+		case <-ctx.Done():
+			return info
+		case <-timer.C:
+			return info
+		case <-ticker.C:
+		}
+	}
+}
+
 func noticeString(data map[string]interface{}, key string) string {
 	value, ok := data[key]
 	if !ok || value == nil {
@@ -252,7 +275,7 @@ func StartTunnel(ctx context.Context, l *slog.Logger, config *psiphon.Config) (*
 
 	select {
 	case <-connected:
-		serverInfo := observedServer.snapshot()
+		serverInfo := observedServer.waitForDiagnosticID(controllerCtx, 2*time.Second)
 		lookedUpServerInfo, err := lookupConnectedServerInfo(config, serverInfo)
 		if err != nil {
 			l.Warn("unable to resolve psiphon connected server entry", "diagnostic_id", serverInfo.DiagnosticID, "error", err)
@@ -268,6 +291,8 @@ func StartTunnel(ctx context.Context, l *slog.Logger, config *psiphon.Config) (*
 				"server_entry_diagnostic_id", serverInfo.DiagnosticID,
 				"protocol", serverInfo.Protocol,
 			)
+		} else {
+			l.Warn("psiphon selected server notice not observed")
 		}
 		return &Tunnel{cancel: cancel, done: done, Server: serverInfo}, nil
 	case err := <-errored:
