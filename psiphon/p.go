@@ -342,6 +342,8 @@ func StartPsiphon(ctx context.Context, l *slog.Logger, wgBind netip.AddrPort, di
 		NetworkID:                                    "test",
 		ClientPlatform:                               "Android_4.0.4_com.example.exampleClientLibraryApp",
 		AllowDefaultDNSResolverWithBindToDevice:      true,
+		EmitDiagnosticNotices:                        true,
+		EmitDiagnosticNetworkParameters:              true,
 		EstablishTunnelTimeoutSeconds:                &timeout,
 		DataRootDirectory:                            dir,
 		MigrateDataStoreDirectory:                    dir,
