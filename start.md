@@ -24,7 +24,17 @@ journalctl -u warp-plus -f
 curl -X POST http://127.0.0.1:9099/connectivity/refresh \
   -H "Authorization: Bearer $WARP_TOKEN"
 ```
+# 先停掉 warp-plus 进程或 systemd 服务
+# 如果你是前台跑的，Ctrl+C 即可
 
+## 备份 + 清空recent_ips 的txt
+```
+cp /var/lib/warp-plus/pool-cache/recent_ips.txt \
+   /var/lib/warp-plus/pool-cache/recent_ips.txt.bak.$(date +%Y%m%d-%H%M%S)
+
+: > /var/lib/warp-plus/pool-cache/recent_ips.txt
+
+```
 
 ## 1. 项目定位
 
