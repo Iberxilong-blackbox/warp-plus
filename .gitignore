@@ -8,3 +8,13 @@ stuff/
 
 .gocache/
 .gomodcache/
+
+# Local editor/agent settings
+.claude/settings.local.json
+
+# Local diagnostics and runtime artifacts
+test-output/
+*.log
+recent_ips.txt
+warp-plus-*-test.exe
+warp-plus-diagnostic.exe

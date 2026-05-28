@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -56,6 +57,9 @@ func (r *tcpRelay) serve() {
 	for {
 		conn, err := r.listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			select {
 			case <-r.ctx.Done():
 				return

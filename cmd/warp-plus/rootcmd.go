@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/adrg/xdg"
@@ -52,6 +53,19 @@ type rootConfig struct {
 	egressScoreMax      int
 	egressMaxRetry      int
 	egressCheckInterval time.Duration
+
+	controlBind          string
+	controlToken         string
+	controlPath          string
+	controlRequireChange bool
+	recentIPFile         string
+	recentIPLimit        int
+	poolMinReady         int
+
+	child      bool
+	childID    int
+	childToken string
+	parentAddr string
 }
 
 func newRootCmd() *rootConfig {
@@ -182,6 +196,62 @@ func newRootCmd() *rootConfig {
 		Value:    ffval.NewValueDefault(&cfg.egressCheckInterval, 5*time.Minute),
 		Usage:    "egress check interval while running; set 0 to disable monitoring",
 	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "control-bind",
+		Value:    ffval.NewValueDefault(&cfg.controlBind, ""),
+		Usage:    "control API bind address; enables manual egress refresh when set",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "control-token",
+		Value:    ffval.NewValueDefault(&cfg.controlToken, ""),
+		Usage:    "bearer token for control API",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "control-path",
+		Value:    ffval.NewValueDefault(&cfg.controlPath, "/connectivity/refresh"),
+		Usage:    "control API refresh path",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "control-require-change",
+		Value:    ffval.NewValueDefault(&cfg.controlRequireChange, true),
+		Usage:    "require refreshed egress IP to differ from current IP",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "recent-ip-file",
+		Value:    ffval.NewValueDefault(&cfg.recentIPFile, ""),
+		Usage:    "recently used egress IP file",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "recent-ip-limit",
+		Value:    ffval.NewValueDefault(&cfg.recentIPLimit, 50),
+		Usage:    "maximum number of recent egress IPs to retain",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "pool-min-ready",
+		Value:    ffval.NewValueDefault(&cfg.poolMinReady, 1),
+		Usage:    "minimum ready children in the pool",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "parent-addr",
+		Value:    ffval.NewValueDefault(&cfg.parentAddr, ""),
+		Usage:    "parent registry address (internal use)",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName:  "child",
+		Value:     ffval.NewValueDefault(&cfg.child, false),
+		Usage:     "run in child process mode (internal use)",
+		NoDefault: true,
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "child-id",
+		Value:    ffval.NewValueDefault(&cfg.childID, 0),
+		Usage:    "child process ID (internal use)",
+	})
+	cfg.flags.AddFlag(ff.FlagConfig{
+		LongName: "child-token",
+		Value:    ffval.NewValueDefault(&cfg.childToken, ""),
+		Usage:    "child registration token (internal use)",
+	})
 	cfg.command = &ff.Command{
 		Name:  appName,
 		Flags: cfg.flags,
@@ -197,12 +267,37 @@ func (c *rootConfig) exec(ctx context.Context, args []string) error {
 		l = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 
+	// ---- Child mode: run a child process, then exit. ----
+	if c.child {
+		if c.parentAddr == "" {
+			fatal(l, errors.New("--parent-addr is required in child mode"))
+		}
+		childCfg := app.ChildConfig{
+			ID:         c.childID,
+			Token:      c.childToken,
+			ParentAddr: c.parentAddr,
+		}
+		return app.RunChild(ctx, l, c.buildWarpOptions(), childCfg)
+	}
+
 	if c.psiphon && c.gool {
 		fatal(l, errors.New("can't use cfon and gool at the same time"))
 	}
 
 	if c.egressCheck && !c.psiphon {
 		fatal(l, errors.New("egress-check is currently supported only with cfon mode"))
+	}
+
+	if c.controlBind != "" && (!c.psiphon || !c.egressCheck) {
+		fatal(l, errors.New("control API is currently supported only with cfon and egress-check mode"))
+	}
+
+	if c.controlPath != "" && !strings.HasPrefix(c.controlPath, "/") {
+		fatal(l, errors.New("control path must start with /"))
+	}
+
+	if c.recentIPLimit < 0 {
+		fatal(l, errors.New("recent-ip-limit must be greater than or equal to 0"))
 	}
 
 	if c.v4 && c.v6 {
@@ -213,15 +308,22 @@ func (c *rootConfig) exec(ctx context.Context, args []string) error {
 		c.v4, c.v6 = true, true
 	}
 
-	bindAddrPort, err := netip.ParseAddrPort(c.bind)
-	if err != nil {
-		fatal(l, fmt.Errorf("invalid bind address: %w", err))
-	}
+	opts := c.buildWarpOptions()
 
-	dnsAddr, err := netip.ParseAddr(c.dns)
-	if err != nil {
-		fatal(l, fmt.Errorf("invalid DNS address: %w", err))
-	}
+	go func() {
+		if err := app.RunWarp(ctx, l, opts); err != nil {
+			fatal(l, err)
+		}
+	}()
+
+	<-ctx.Done()
+
+	return nil
+}
+
+func (c *rootConfig) buildWarpOptions() app.WarpOptions {
+	bindAddrPort, _ := netip.ParseAddrPort(c.bind)
+	dnsAddr, _ := netip.ParseAddr(c.dns)
 
 	opts := app.WarpOptions{
 		Bind:            bindAddrPort,
@@ -247,18 +349,18 @@ func (c *rootConfig) exec(ctx context.Context, args []string) error {
 	}
 
 	if c.psiphon {
-		l.Info("psiphon mode enabled", "country", c.country)
 		opts.Psiphon = &app.PsiphonOptions{Country: c.country}
 	}
 
 	if c.egressCheck {
 		blacklist, err := egresscheck.LoadBlacklist(c.egressBlacklistPath)
 		if err != nil {
-			fatal(l, fmt.Errorf("invalid egress blacklist: %w", err))
+			fatal(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})), fmt.Errorf("invalid egress blacklist: %w", err))
 		}
 		opts.EgressCheck = &egresscheck.Config{
 			IPURL:         c.egressIPURL,
 			Blacklist:     blacklist,
+			BlacklistPath: c.egressBlacklistPath,
 			ScoreAPI:      c.egressScoreAPI,
 			ScoreMax:      c.egressScoreMax,
 			MaxRetry:      c.egressMaxRetry,
@@ -266,27 +368,41 @@ func (c *rootConfig) exec(ctx context.Context, args []string) error {
 		}
 	}
 
+	if c.controlBind != "" {
+		controlBind, err := netip.ParseAddrPort(c.controlBind)
+		if err != nil {
+			fatal(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})), fmt.Errorf("invalid control bind address: %w", err))
+		}
+		if !controlBind.Addr().IsLoopback() && c.controlToken == "" {
+			fatal(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})), errors.New("control-token is required when control-bind is not loopback"))
+		}
+		recentIPFile := c.recentIPFile
+		if recentIPFile == "" {
+			recentIPFile = path.Join(opts.CacheDir, "recent_ips.txt")
+		}
+		opts.RotateControl = &app.RotateControlOptions{
+			Bind:          controlBind,
+			Token:         c.controlToken,
+			Path:          c.controlPath,
+			RequireChange: c.controlRequireChange,
+			RecentIPFile:  recentIPFile,
+			RecentIPLimit: c.recentIPLimit,
+			PoolMinReady:  c.poolMinReady,
+			BlacklistPath: c.egressBlacklistPath,
+		}
+	}
+
 	if c.scan {
-		l.Info("scanner mode enabled", "max-rtt", c.rtt)
 		opts.Scan = &wiresocks.ScanOptions{V4: c.v4, V6: c.v6, MaxRTT: c.rtt}
 	}
 
-	// If the endpoint is not set, choose a random warp endpoint
 	if opts.Endpoint == "" {
 		addrPort, err := warp.RandomWarpEndpoint(c.v4, c.v6)
 		if err != nil {
-			fatal(l, err)
+			fatal(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})), err)
 		}
 		opts.Endpoint = addrPort.String()
 	}
 
-	go func() {
-		if err := app.RunWarp(ctx, l, opts); err != nil {
-			fatal(l, err)
-		}
-	}()
-
-	<-ctx.Done()
-
-	return nil
+	return opts
 }

@@ -7,6 +7,7 @@ const DefaultIPURL = "https://api.ipify.org"
 type Config struct {
 	IPURL         string
 	Blacklist     *Blacklist
+	BlacklistPath string
 	ScoreAPI      string
 	ScoreMax      int
 	MaxRetry      int

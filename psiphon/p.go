@@ -115,7 +115,7 @@ func StartTunnel(ctx context.Context, l *slog.Logger, config *psiphon.Config) (*
 
 	if err := psiphon.OpenDataStore(config); err != nil {
 		cancel()
-		return nil, errors.New("failed to open data store")
+		return nil, fmt.Errorf("failed to open data store: %w", err)
 	}
 
 	if err := psiphon.ImportEmbeddedServerEntries(controllerCtx, config, "", ""); err != nil {
@@ -148,6 +148,13 @@ func StartTunnel(ctx context.Context, l *slog.Logger, config *psiphon.Config) (*
 	}()
 
 	// Wait for an active tunnel or error
+	establishTimeout := 75 * time.Second
+	if config.EstablishTunnelTimeoutSeconds != nil && *config.EstablishTunnelTimeoutSeconds > 0 {
+		establishTimeout = time.Duration(*config.EstablishTunnelTimeoutSeconds+15) * time.Second
+	}
+	timer := time.NewTimer(establishTimeout)
+	defer timer.Stop()
+
 	select {
 	case <-connected:
 		return &Tunnel{cancel: cancel, done: done}, nil
@@ -156,6 +163,24 @@ func StartTunnel(ctx context.Context, l *slog.Logger, config *psiphon.Config) (*
 		psiphon.CloseDataStore()
 		psiphon.SetNoticeWriter(io.Discard)
 		return nil, err
+	case <-timer.C:
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+		psiphon.CloseDataStore()
+		psiphon.SetNoticeWriter(io.Discard)
+		return nil, fmt.Errorf("clientlib: tunnel establishment hard timeout after %s", establishTimeout)
+	case <-controllerCtx.Done():
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+		psiphon.CloseDataStore()
+		psiphon.SetNoticeWriter(io.Discard)
+		return nil, controllerCtx.Err()
 	}
 }
 
@@ -187,7 +212,12 @@ func StartPsiphon(ctx context.Context, l *slog.Logger, wgBind netip.AddrPort, di
 		MigrateRemoteServerListDownloadFilename:      filepath.Join(dir, "server_list_compressed"),
 	}
 
-	l.Info("starting handshake")
+	l.Info(
+		"starting handshake",
+		"data_root", config.DataRootDirectory,
+		"migrate_data_store", config.MigrateDataStoreDirectory,
+		"migrate_server_list", config.MigrateRemoteServerListDownloadFilename,
+	)
 	tunnel, err := StartTunnel(ctx, l, &config)
 	if err != nil {
 		return nil, fmt.Errorf("Unable to start psiphon: %w", err)
