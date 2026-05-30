@@ -38,6 +38,11 @@ systemctl restart warp-plus
  
 ```
 
+## 创建/修改配置文件
+```bash
+nano /etc/default/warp-plus
+```
+
 ## 1. 项目定位
 
 `warp-plus` 是一个 Go 项目。普通模式下，它会建立 Cloudflare WARP 隧道，并在本机启动一个本地代理服务。
